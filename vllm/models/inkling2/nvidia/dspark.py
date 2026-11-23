@@ -159,19 +159,22 @@ class Inkling2DraftSelfAttention(nn.Module):
         self.k_norm_ctx = _RMSNorm(self.head_dim, self.eps)
         # Owns the paged KV cache only; the same spec as the target's layers
         # (the scheduler keeps the last sliding_window_size positions before
-        # the block, which is what the draft reads).
+        # the block, which is what the draft reads). The cache config gives
+        # it the target's KV dtype, so its layers share the target's block
+        # tables instead of splitting every layer into its own group.
+        vllm_config = get_current_vllm_config()
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
+            cache_config=vllm_config.cache_config,
             per_layer_sliding_window=config.sliding_window_size if is_local else None,
             prefix=f"{prefix}.attn",
             attn_backend=FlashAttentionBackend,
         )
         # Keys a block sees: itself and, if local, the window before it.
         self.window = config.sliding_window_size + self.block if is_local else 0
-        vllm_config = get_current_vllm_config()
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.register_buffer(
             "cu_seqlens_q",
@@ -214,7 +217,11 @@ class Inkling2DraftSelfAttention(nn.Module):
                 v.view(-1, self.num_kv_heads, self.head_dim),
                 md.slot_mapping[: q.shape[0]],
             )
-            key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
+            kv_cache = self.attn.kv_cache
+            if kv_cache.dtype == torch.uint8:
+                # "fp8" caches are byte storage holding unit-scale E4M3.
+                kv_cache = kv_cache.view(torch.float8_e4m3fn)
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
                 self.head_dim, dim=-1
             )
             num_reqs = min(q.shape[0] // self.block, md.seq_lens.shape[0])

@@ -294,6 +294,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         supported: tuple[str, ...] = ("auto", "bfloat16")
         if current_platform.is_device_capability_family(120):
             supported += ("float16", "fp8", "fp8_e4m3")
+        elif use_sm100_kernels():
+            # Unit-scale E4M3, as on SM120: the split-KV decode kernel widens
+            # it to bf16; prefill runs the portable kernel (no FA4 E4M3 path).
+            supported += ("fp8", "fp8_e4m3")
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
@@ -304,7 +308,11 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if prefix in forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         forward_context[prefix] = self
-        if vllm_config.kernel_config.enable_jit_warmup and use_sm100_kernels():
+        if (
+            vllm_config.kernel_config.enable_jit_warmup
+            and use_sm100_kernels()
+            and not self.fp8_kv
+        ):
             _INKLING2_FA4_REL_ATTENTION_KERNEL.register_warmup()
 
     def process_weights_after_loading(self) -> None:
@@ -615,7 +623,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if num_decodes:
             cu_seqlens_q = cu_seqlens_q - num_decode_tokens
         key_cache, value_cache = self._split_kv_cache(kv_cache)
-        if not use_sm100_kernels():
+        if not use_sm100_kernels() or self.fp8_kv:
             rel_attention(
                 q[:nt],
                 key_cache,

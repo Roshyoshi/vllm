@@ -370,6 +370,8 @@ _FA4_BLOCK_N = 128
 # Query rows (tokens x GQA group) of a CTA.
 _VERIFY_BLOCK_M = 64
 _VERIFY_STAGES = 3
+# E4M3 caches: TMA ring of E4M3 K/V blocks, widened into one bf16 K and V block.
+_VERIFY_STAGES_FP8 = 4
 
 
 def plan_decode_attention(
@@ -566,13 +568,14 @@ def _verify_load_block(
     BLOCK_N: gl.constexpr,
     D: gl.constexpr,
     STAGES: gl.constexpr,
+    KV_BYTES: gl.constexpr,
 ):
     """TMA-load K and V of the split's block `i`, one page-sized slab at a time."""
     SUB: gl.constexpr = min(PAGE, BLOCK_N)
     block_table = BlockTable + req * stride_bt
     key = (n_first + i * num_splits) * BLOCK_N
     stage = i % STAGES
-    _bw.mbarrier.expect(kv_ready.index(stage), 2 * BLOCK_N * D * 2)
+    _bw.mbarrier.expect(kv_ready.index(stage), 2 * BLOCK_N * D * KV_BYTES)
     for t in gl.static_range(BLOCK_N // SUB):
         page = gl.load(block_table + (key + t * SUB) // PAGE)
         row = page * page_rows + kv_head * head_rows + (key + t * SUB) % PAGE
@@ -605,6 +608,7 @@ def _verify_load(
     BLOCK_N: gl.constexpr,
     D: gl.constexpr,
     STAGES: gl.constexpr,
+    KV_BYTES: gl.constexpr,
 ):
     """Stream the split's K/V blocks after the first `num_pre`."""
     for i in range(num_pre, num_iters):
@@ -628,6 +632,7 @@ def _verify_load(
             BLOCK_N,
             D,
             STAGES,
+            KV_BYTES,
         )
 
 
@@ -680,6 +685,130 @@ def _verify_mma(
                 mbarriers=[kv_empty.index(j % STAGES), o_done],
             )
     _bw.tcgen05_commit(o_final)
+
+
+@gluon.jit
+def _verify_mma_fp8(
+    q_smem,
+    k_smem,
+    v_smem,
+    s_tmem,
+    o_tmem,
+    k_ready,
+    k_empty,
+    v_ready,
+    v_empty,
+    s_ready,
+    p_ready,
+    o_done,
+    o_final,
+    num_iters,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    """`_verify_mma` on the single bf16 K and V blocks widened from E4M3:
+    S = Q K^T frees K for the next block, O += P V frees V."""
+    for i in range(num_iters + 1):
+        if i < num_iters:
+            _bw.mbarrier.wait(k_ready, i & 1)
+            _bw.tcgen05_mma(
+                q_smem,
+                k_smem.permute((1, 0)),
+                s_tmem.index(i % 2),
+                use_acc=False,
+                mbarriers=[s_ready.index(i % 2), k_empty],
+            )
+        if i > 0:
+            j = i - 1
+            _bw.mbarrier.wait(p_ready.index(j % 2), j // 2 & 1)
+            _bw.mbarrier.wait(v_ready, j & 1)
+            _bw.tcgen05_mma(
+                _verify_p(s_tmem, j % 2, BLOCK_M, BLOCK_N),
+                v_smem,
+                o_tmem,
+                use_acc=j > 0,
+                mbarriers=[v_empty, o_done],
+            )
+    _bw.tcgen05_commit(o_final)
+
+
+@gluon.jit
+def _e4m3_to_bf16(x):
+    """Exact E4M3 -> bf16 with ALU ops (no cvt): each byte moves to the top
+    of a 16-bit lane, exponent and mantissa shift right by 4 under the sign,
+    and a bf16 multiply by 2^120 moves the exponent bias from 7 to 127
+    (subnormals included)."""
+    return gl.inline_asm_elementwise(
+        """
+        {
+        .reg .b32 lo, hi, t, bias;
+        mov.b32 bias, 0x7B807B80;
+        prmt.b32 lo, $2, 0, 0x1404;
+        prmt.b32 hi, $2, 0, 0x3424;
+        and.b32 t, lo, 0x7F007F00;
+        shr.b32 t, t, 4;
+        lop3.b32 lo, lo, t, 0x80008000, 0xEC;
+        and.b32 t, hi, 0x7F007F00;
+        shr.b32 t, t, 4;
+        lop3.b32 hi, hi, t, 0x80008000, 0xEC;
+        mul.rn.bf16x2 $0, lo, bias;
+        mul.rn.bf16x2 $1, hi, bias;
+        }
+        """,
+        "=r,=r,r",
+        [x.to(gl.uint8, bitcast=True)],
+        dtype=gl.bfloat16,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@gluon.jit
+def _verify_widen(
+    k8_smem,
+    v8_smem,
+    k_smem,
+    v_smem,
+    f8_ready,
+    f8_empty,
+    k_ready,
+    k_empty,
+    v_ready,
+    v_empty,
+    num_iters,
+    BLOCK_N: gl.constexpr,
+    D: gl.constexpr,
+    STAGES: gl.constexpr,
+):
+    """Widen each E4M3 K/V block of the TMA ring to bf16 (exact) for tcgen05,
+    half a block at a time, in the order `_verify_mma_fp8` consumes them
+    (K0, K1, V0, K2, V1, ...): K once the last S = Q K^T is done, V once the
+    last O += P V is done."""
+    HALF: gl.constexpr = BLOCK_N // 2
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 16], [4, 8], [gl.num_warps(), 1], [1, 0]
+    )
+    for i in range(num_iters + 1):
+        if i < num_iters:
+            stage = i % STAGES
+            _bw.mbarrier.wait(f8_ready.index(stage), i // STAGES & 1)
+            _bw.mbarrier.wait(k_empty, (i & 1) ^ 1)
+            for h in gl.static_range(2):
+                x = k8_smem.index(stage).slice(h * HALF, HALF).load(layout)
+                k_smem.slice(h * HALF, HALF).store(_e4m3_to_bf16(x))
+            _bw.fence_async_shared()
+            gl.barrier()
+            _bw.mbarrier.arrive(k_ready, count=1)
+        if i > 0:
+            j = i - 1
+            _bw.mbarrier.wait(v_empty, (j & 1) ^ 1)
+            for h in gl.static_range(2):
+                x = v8_smem.index(j % STAGES).slice(h * HALF, HALF).load(layout)
+                v_smem.slice(h * HALF, HALF).store(_e4m3_to_bf16(x))
+            _bw.fence_async_shared()
+            gl.barrier()
+            _bw.mbarrier.arrive(v_ready, count=1)
+            _bw.mbarrier.arrive(f8_empty.index(j % STAGES), count=1)
 
 
 @gluon.jit
@@ -892,6 +1021,7 @@ def _rel_verify_kernel(
     FUSE_GATE: gl.constexpr,
     DRAFT: gl.constexpr,
     WINDOW: gl.constexpr,
+    FP8: gl.constexpr,
 ):
     """One split of one request and KV head: fp32 partial output, log2 LSE.
 
@@ -905,8 +1035,11 @@ def _rel_verify_kernel(
     `DRAFT` is plain block attention (the DSpark drafter): no relative
     logits, gate or sink, and every query of a request sits at its last
     position. Local layers see `WINDOW` keys up to a query's position.
+    `FP8`: the cache holds unit-scale E4M3; a widening partition converts
+    each block of the TMA ring to bf16 for the MMA warp.
     """
     G: gl.constexpr = H // HKV
+    KV_BYTES: gl.constexpr = 1 if FP8 else 2
     split = gl.program_id(0)
     kv_head = gl.program_id(1)
     req = gl.program_id(2)
@@ -946,11 +1079,12 @@ def _rel_verify_kernel(
 
     s_layout: gl.constexpr = _bw.TensorMemoryLayout((BLOCK_M, BLOCK_N), col_stride=1)
     o_layout: gl.constexpr = _bw.TensorMemoryLayout((BLOCK_M, D), col_stride=1)
-    k_smem = gl.allocate_shared_memory(
-        gl.bfloat16, [STAGES, BLOCK_N, D], kv_desc.layout
+    # The TMA ring (bf16, or E4M3 widened into k_smem / v_smem).
+    ring_k = gl.allocate_shared_memory(
+        kv_desc.dtype, [STAGES, BLOCK_N, D], kv_desc.layout
     )
-    v_smem = gl.allocate_shared_memory(
-        gl.bfloat16, [STAGES, BLOCK_N, D], kv_desc.layout
+    ring_v = gl.allocate_shared_memory(
+        kv_desc.dtype, [STAGES, BLOCK_N, D], kv_desc.layout
     )
     s_tmem = _bw.allocate_tensor_memory(gl.float32, [2, BLOCK_M, BLOCK_N], s_layout)
     o_tmem = _bw.allocate_tensor_memory(gl.float32, [BLOCK_M, D], o_layout)
@@ -969,6 +1103,15 @@ def _rel_verify_kernel(
         _bw.mbarrier.init(p_ready.index(k), count=1)
     _bw.mbarrier.init(o_done, count=1)
     _bw.mbarrier.init(o_final, count=1)
+    if FP8:
+        wide_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for(
+            [BLOCK_N, D], gl.bfloat16
+        )
+        k_smem = gl.allocate_shared_memory(gl.bfloat16, [BLOCK_N, D], wide_layout)
+        v_smem = gl.allocate_shared_memory(gl.bfloat16, [BLOCK_N, D], wide_layout)
+        wide_bars = gl.allocate_shared_memory(gl.int64, [4, 1], bar_layout)
+        for k in gl.static_range(4):
+            _bw.mbarrier.init(wide_bars.index(k), count=1)
 
     _bw.fence_async_shared()
     gl.barrier()
@@ -980,8 +1123,8 @@ def _rel_verify_kernel(
         if i < num_pre:
             _verify_load_block(
                 kv_desc,
-                k_smem,
-                v_smem,
+                ring_k,
+                ring_v,
                 kv_ready,
                 BlockTable,
                 req,
@@ -997,6 +1140,7 @@ def _rel_verify_kernel(
                 BLOCK_N,
                 D,
                 STAGES,
+                KV_BYTES,
             )
     gl.inline_asm_elementwise(
         "griddepcontrol.wait; // $0", "=r", [], dtype=gl.int32, is_pure=False, pack=1
@@ -1005,104 +1149,226 @@ def _rel_verify_kernel(
     q_smem = gl.allocate_shared_memory(gl.bfloat16, [BLOCK_M, D], smem_layout, q)
     _bw.fence_async_shared()
 
-    gl.warp_specialize(
-        [
-            (
-                _verify_softmax,
+    if FP8:
+        gl.warp_specialize(
+            [
                 (
-                    s_tmem,
-                    o_tmem,
-                    s_ready,
-                    p_ready,
-                    o_done,
-                    o_final,
-                    Rel,
-                    OPart,
-                    LsePart,
-                    Gate,
-                    Sink,
-                    Y,
-                    stride_gate,
-                    stride_sink,
-                    q_start,
-                    q_len,
-                    seqlen_k,
-                    pos0,
-                    kv_head,
-                    split,
-                    num_splits,
-                    num_tokens,
-                    n_first,
-                    n_bias,
-                    num_iters,
-                    fa_mask_left,
-                    fa_mask_right,
-                    softmax_scale,
-                    stride_rel_t,
-                    rel_base,
-                    H,
-                    G,
-                    D,
-                    REL,
-                    REL_PAD,
-                    IS_LOCAL,
-                    BLOCK_M,
-                    BLOCK_N,
-                    FA_BLOCK,
-                    FUSE_GATE,
-                    DRAFT,
-                    WINDOW,
+                    _verify_softmax,
+                    (
+                        s_tmem,
+                        o_tmem,
+                        s_ready,
+                        p_ready,
+                        o_done,
+                        o_final,
+                        Rel,
+                        OPart,
+                        LsePart,
+                        Gate,
+                        Sink,
+                        Y,
+                        stride_gate,
+                        stride_sink,
+                        q_start,
+                        q_len,
+                        seqlen_k,
+                        pos0,
+                        kv_head,
+                        split,
+                        num_splits,
+                        num_tokens,
+                        n_first,
+                        n_bias,
+                        num_iters,
+                        fa_mask_left,
+                        fa_mask_right,
+                        softmax_scale,
+                        stride_rel_t,
+                        rel_base,
+                        H,
+                        G,
+                        D,
+                        REL,
+                        REL_PAD,
+                        IS_LOCAL,
+                        BLOCK_M,
+                        BLOCK_N,
+                        FA_BLOCK,
+                        FUSE_GATE,
+                        DRAFT,
+                        WINDOW,
+                    ),
                 ),
-            ),
-            (
-                _verify_load,
                 (
-                    kv_desc,
-                    k_smem,
-                    v_smem,
-                    kv_ready,
-                    kv_empty,
-                    BlockTable,
-                    req,
-                    kv_head,
-                    stride_bt,
-                    n_first,
-                    num_splits,
-                    num_pre,
-                    num_iters,
-                    page_rows,
-                    head_rows,
-                    head_cols,
-                    PAGE,
-                    BLOCK_N,
-                    D,
-                    STAGES,
+                    _verify_load,
+                    (
+                        kv_desc,
+                        ring_k,
+                        ring_v,
+                        kv_ready,
+                        kv_empty,
+                        BlockTable,
+                        req,
+                        kv_head,
+                        stride_bt,
+                        n_first,
+                        num_splits,
+                        num_pre,
+                        num_iters,
+                        page_rows,
+                        head_rows,
+                        head_cols,
+                        PAGE,
+                        BLOCK_N,
+                        D,
+                        STAGES,
+                        KV_BYTES,
+                    ),
                 ),
-            ),
-            (
-                _verify_mma,
                 (
-                    q_smem,
-                    k_smem,
-                    v_smem,
-                    s_tmem,
-                    o_tmem,
-                    kv_ready,
-                    kv_empty,
-                    s_ready,
-                    p_ready,
-                    o_done,
-                    o_final,
-                    num_iters,
-                    BLOCK_M,
-                    BLOCK_N,
-                    STAGES,
+                    _verify_mma_fp8,
+                    (
+                        q_smem,
+                        k_smem,
+                        v_smem,
+                        s_tmem,
+                        o_tmem,
+                        wide_bars.index(0),
+                        wide_bars.index(1),
+                        wide_bars.index(2),
+                        wide_bars.index(3),
+                        s_ready,
+                        p_ready,
+                        o_done,
+                        o_final,
+                        num_iters,
+                        BLOCK_M,
+                        BLOCK_N,
+                    ),
                 ),
-            ),
-        ],
-        [1, 1],
-        [24, 24],
-    )
+                (
+                    _verify_widen,
+                    (
+                        ring_k,
+                        ring_v,
+                        k_smem,
+                        v_smem,
+                        kv_ready,
+                        kv_empty,
+                        wide_bars.index(0),
+                        wide_bars.index(1),
+                        wide_bars.index(2),
+                        wide_bars.index(3),
+                        num_iters,
+                        BLOCK_N,
+                        D,
+                        STAGES,
+                    ),
+                ),
+            ],
+            [1, 1, 8],
+            [24, 24, 72],
+        )
+    else:
+        gl.warp_specialize(
+            [
+                (
+                    _verify_softmax,
+                    (
+                        s_tmem,
+                        o_tmem,
+                        s_ready,
+                        p_ready,
+                        o_done,
+                        o_final,
+                        Rel,
+                        OPart,
+                        LsePart,
+                        Gate,
+                        Sink,
+                        Y,
+                        stride_gate,
+                        stride_sink,
+                        q_start,
+                        q_len,
+                        seqlen_k,
+                        pos0,
+                        kv_head,
+                        split,
+                        num_splits,
+                        num_tokens,
+                        n_first,
+                        n_bias,
+                        num_iters,
+                        fa_mask_left,
+                        fa_mask_right,
+                        softmax_scale,
+                        stride_rel_t,
+                        rel_base,
+                        H,
+                        G,
+                        D,
+                        REL,
+                        REL_PAD,
+                        IS_LOCAL,
+                        BLOCK_M,
+                        BLOCK_N,
+                        FA_BLOCK,
+                        FUSE_GATE,
+                        DRAFT,
+                        WINDOW,
+                    ),
+                ),
+                (
+                    _verify_load,
+                    (
+                        kv_desc,
+                        ring_k,
+                        ring_v,
+                        kv_ready,
+                        kv_empty,
+                        BlockTable,
+                        req,
+                        kv_head,
+                        stride_bt,
+                        n_first,
+                        num_splits,
+                        num_pre,
+                        num_iters,
+                        page_rows,
+                        head_rows,
+                        head_cols,
+                        PAGE,
+                        BLOCK_N,
+                        D,
+                        STAGES,
+                        KV_BYTES,
+                    ),
+                ),
+                (
+                    _verify_mma,
+                    (
+                        q_smem,
+                        ring_k,
+                        ring_v,
+                        s_tmem,
+                        o_tmem,
+                        kv_ready,
+                        kv_empty,
+                        s_ready,
+                        p_ready,
+                        o_done,
+                        o_final,
+                        num_iters,
+                        BLOCK_M,
+                        BLOCK_N,
+                        STAGES,
+                    ),
+                ),
+            ],
+            [1, 1],
+            [24, 24],
+        )
 
 
 def rel_decode_attention(
@@ -1327,7 +1593,11 @@ def _launch_rel_verify(
     # The paged cache as 2D rows of (K | V) per KV head: a page's slots
     # are rows, KV heads sit either side by side in a row or in row blocks.
     page_stride, slot_stride, head_stride = key_cache.stride()[:3]
-    assert value_cache.data_ptr() == key_cache.data_ptr() + head_dim * 2
+    fp8 = key_cache.dtype == torch.float8_e4m3fn
+    assert key_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+    assert value_cache.data_ptr() == (
+        key_cache.data_ptr() + head_dim * key_cache.element_size()
+    )
     assert page_stride % slot_stride == 0 and slot_stride >= 2 * head_dim
     if head_stride < slot_stride:
         head_rows, head_cols = 0, head_stride
@@ -1338,8 +1608,9 @@ def _launch_rel_verify(
         (num_blocks * page_stride // slot_stride, slot_stride), (slot_stride, 1)
     )
     block = [min(page, _FA4_BLOCK_N), head_dim]
+    kv_dtype = gl.float8e4nv if fp8 else gl.bfloat16
     kv_desc = gluon.nvidia.hopper.TensorDescriptor.from_tensor(
-        kv_rows, block, gl.NVMMASharedLayout.get_default_for(block, gl.bfloat16)
+        kv_rows, block, gl.NVMMASharedLayout.get_default_for(block, kv_dtype)
     )
     _rel_verify_kernel[grid](
         q,
@@ -1374,10 +1645,11 @@ def _launch_rel_verify(
         BLOCK_M=_VERIFY_BLOCK_M,
         BLOCK_N=_FA4_BLOCK_N,
         FA_BLOCK=_FA4_BLOCK_N,
-        STAGES=_VERIFY_STAGES,
+        STAGES=_VERIFY_STAGES_FP8 if fp8 else _VERIFY_STAGES,
         FUSE_GATE=fuse_gate,
         DRAFT=draft,
         WINDOW=window,
+        FP8=fp8,
         num_warps=4,
         launch_pdl=True,
     )
