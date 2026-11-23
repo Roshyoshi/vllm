@@ -21,9 +21,60 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 from vllm.utils.flashinfer import has_flashinfer
 
 logger = init_logger(__name__)
+
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _soft_cap_kernel(
+        X, Y, stride_x, n_cols, inv_cap, cap, ROUND: tl.constexpr, BLOCK: tl.constexpr
+    ):
+        # torch.tanh(x / cap) * cap as torch's CUDA kernels compute it: x times
+        # the fp32 reciprocal of cap, fp32 tanh, times cap, with a rounding to
+        # the logits dtype after each step (ROUND) unless the logits are fp32.
+        row = tl.program_id(1).to(tl.int64)
+        cols = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < n_cols
+        x = tl.load(X + row * stride_x + cols, mask=mask, other=0).to(tl.float32)
+        x = x * inv_cap
+        if ROUND:
+            x = x.to(Y.dtype.element_ty).to(tl.float32)
+        x = tldevice.tanh(x)
+        if ROUND:
+            x = x.to(Y.dtype.element_ty).to(tl.float32)
+        tl.store(Y + row * n_cols + cols, (x * cap).to(Y.dtype.element_ty), mask=mask)
+
+
+def _soft_cap(logits: torch.Tensor, soft_cap: float) -> torch.Tensor:
+    """`tanh(logits / soft_cap) * soft_cap` in one pass over the logits."""
+    if not (
+        HAS_TRITON
+        and logits.is_cuda
+        and logits.dim() == 2
+        and logits.stride(1) == 1
+        and logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
+    ):
+        return torch.tanh(logits / soft_cap) * soft_cap
+    rows, n_cols = logits.shape
+    out = torch.empty((rows, n_cols), dtype=logits.dtype, device=logits.device)
+    if rows and n_cols:
+        cap = torch.tensor(soft_cap, dtype=torch.float32)
+        inv_cap = (torch.tensor(1.0, dtype=torch.float32) / cap).item()
+        _soft_cap_kernel[(triton.cdiv(n_cols, 4096), rows)](
+            logits,
+            out,
+            logits.stride(0),
+            n_cols,
+            inv_cap,
+            cap.item(),
+            ROUND=logits.dtype != torch.float32,
+            BLOCK=4096,
+        )
+    return out
 
 
 @cache
@@ -111,9 +162,7 @@ class LogitsProcessor(PluggableLayer):
             )
         if logits is not None:
             if self.soft_cap is not None:
-                logits = logits / self.soft_cap
-                logits = torch.tanh(logits)
-                logits = logits * self.soft_cap
+                logits = _soft_cap(logits, self.soft_cap)
 
             if self.scale != 1.0:
                 logits *= self.scale
@@ -234,7 +283,7 @@ class LogitsProcessor(PluggableLayer):
 
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         if self.soft_cap is not None:
-            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+            logits = _soft_cap(logits, self.soft_cap)
         if self.scale != 1.0:
             logits = logits * self.scale
 
@@ -292,7 +341,7 @@ class LogitsProcessor(PluggableLayer):
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         if return_log_probs:
             if self.soft_cap is not None:
-                logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+                logits = _soft_cap(logits, self.soft_cap)
             if self.scale != 1.0:
                 logits = logits * self.scale
 
